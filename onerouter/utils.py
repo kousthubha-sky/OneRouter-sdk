@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 
 from .client import OneRouter
 
@@ -8,15 +9,68 @@ from .client import OneRouter
 # ============================================
 
 class OneRouterSync:
-    """Synchronous wrapper for OneRouter (for non-async code)"""
+    """
+    Synchronous wrapper for OneRouter async client.
+    
+    Provides a synchronous interface for applications that don't use async/await.
+    Properly manages event loop creation and cleanup to avoid resource leaks.
+    
+    Usage:
+        client = OneRouterSync(api_key="sk-...")
+        try:
+            result = client.payments.create(...)
+        finally:
+            client.close()
+    """
 
     def __init__(self, api_key: str, **kwargs):
+        """
+        Initialize sync wrapper.
+        
+        Args:
+            api_key: OneRouter API key
+            **kwargs: Additional arguments passed to OneRouter client
+        """
         self.async_client = OneRouter(api_key=api_key, **kwargs)
-        self._loop = asyncio.get_event_loop()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._own_loop = False
+
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        """
+        Get or create event loop.
+        
+        Strategy:
+        1. Try to get running loop (Python 3.10+ compatible)
+        2. If no running loop, create new one and track ownership
+        3. Reuse created loop for subsequent calls
+        
+        Returns:
+            Event loop instance
+        """
+        if self._loop is None:
+            try:
+                # Try to get currently running loop (thread-safe)
+                self._loop = asyncio.get_running_loop()
+                self._own_loop = False  # We don't own it
+            except RuntimeError:
+                # No running loop in this thread, create new one
+                self._loop = asyncio.new_event_loop()
+                self._own_loop = True  # We own it, must close it
+                asyncio.set_event_loop(self._loop)
+        return self._loop
 
     def _run_async(self, coro):
-        """Run async coroutine in sync context"""
-        return self._loop.run_until_complete(coro)
+        """
+        Run async coroutine synchronously.
+        
+        Args:
+            coro: Coroutine to execute
+            
+        Returns:
+            Result from coroutine
+        """
+        loop = self._get_loop()
+        return loop.run_until_complete(coro)
 
     @property
     def payments(self):
@@ -35,7 +89,7 @@ class OneRouterSync:
             def refund(self, **kwargs):
                 return self._loop.run_until_complete(self._async.refund(**kwargs))
 
-        return SyncPayments(self.async_client.payments, self._loop)
+        return SyncPayments(self.async_client.payments, self._get_loop())
 
     @property
     def subscriptions(self):
@@ -54,7 +108,7 @@ class OneRouterSync:
             def cancel(self, **kwargs):
                 return self._loop.run_until_complete(self._async.cancel(**kwargs))
 
-        return SyncSubscriptions(self.async_client.subscriptions, self._loop)
+        return SyncSubscriptions(self.async_client.subscriptions, self._get_loop())
 
     @property
     def payment_links(self):
@@ -67,8 +121,20 @@ class OneRouterSync:
             def create(self, **kwargs):
                 return self._loop.run_until_complete(self._async.create(**kwargs))
 
-        return SyncPaymentLinks(self.async_client.payment_links, self._loop)
+        return SyncPaymentLinks(self.async_client.payment_links, self._get_loop())
 
     def close(self):
-        """Close client"""
-        self._run_async(self.async_client.close())
+        """
+        Close client and cleanup resources.
+        
+        - Closes async client
+        - Only closes event loop if we created it
+        - Safe to call multiple times
+        """
+        try:
+            self._run_async(self.async_client.close())
+        finally:
+            # Only close loop if we created it
+            if self._own_loop and self._loop and not self._loop.is_closed():
+                self._loop.close()
+                self._loop = None
